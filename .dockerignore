@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+tests
+.env
+.env.*
+!.env.example
+uploads/*
+!uploads/.gitkeep
+*.log
+.git
+.gitignore
+README.md
+jest.config.cjs

@@ -1,0 +1,820 @@
+// IMMO-tec — Schéma PostgreSQL MVP
+// Multi-tenant : toute donnée métier porte organizationId
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum OrganizationType {
+  AGENCY // Agence immobilière
+  OWNER  // Propriétaire particulier ou société
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ORG_ADMIN
+  AGENT
+  TENANT
+  TECHNICIAN
+  // Rôles futurs (matrice RBAC préparée)
+  ACCOUNTANT
+  MANAGER
+  MAINTENANCE_LEAD
+  VISITOR
+  SUPPORT
+  SYSTEM_BOT
+}
+
+enum ApartmentStatus {
+  AVAILABLE
+  OCCUPIED
+  MAINTENANCE
+  UNAVAILABLE
+}
+
+enum LeaseStatus {
+  DRAFT
+  ACTIVE
+  EXPIRED
+  TERMINATED
+}
+
+enum PaymentStatus {
+  PENDING   // À payer
+  PAID      // Payé
+  LATE      // En retard
+  PARTIAL   // Paiement partiel
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  MOBILE_MONEY
+  BANK_TRANSFER
+  CHECK
+  OTHER
+}
+
+enum NotificationType {
+  PAYMENT_DUE_SOON
+  PAYMENT_LATE
+  PAYMENT_DUNNING
+  PAYMENT_OWNER_ALERT
+  PAYMENT_RECEIVED
+  MAINTENANCE_CREATED
+  MAINTENANCE_ASSIGNED
+  MAINTENANCE_COMPLETED
+  SYSTEM
+}
+
+enum MaintenancePriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum MaintenanceTicketStatus {
+  OPEN
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  CLOSED
+  CANCELLED
+}
+
+enum MaintenanceEventType {
+  CREATED
+  PRIORITY_SET
+  ASSIGNED
+  STATUS_CHANGED
+  NOTE_ADDED
+  CLOSED
+}
+
+enum RentFollowUpType {
+  DUE_SOON
+  DUNNING_L1
+  DUNNING_L2
+  DUNNING_L3
+  OWNER_ALERT
+}
+
+enum DocumentType {
+  APARTMENT_PHOTO
+  LEASE_CONTRACT
+  PAYMENT_RECEIPT
+  ID_DOCUMENT
+  OTHER
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  GRACE_PERIOD
+  SUSPENDED
+  CANCELLED
+}
+
+enum SubscriptionPlan {
+  STARTER
+  PRO
+  ENTERPRISE
+}
+
+// ─── Organisation (tenant SaaS) ──────────────────────────────────────────────
+
+model Organization {
+  id        String           @id @default(cuid())
+  name      String
+  type      OrganizationType
+  email     String?
+  phone     String?
+  address   String?
+  city      String           @default("Brazzaville")
+  country   String           @default("CG")
+  isActive  Boolean          @default(true)
+  isValidated Boolean        @default(true) // false = agence en attente validation admin plateforme
+
+  // Abonnement SaaS (cache dénormalisé pour accès rapide)
+  subscriptionId        String?            @unique
+  subscriptionStatus    SubscriptionStatus @default(ACTIVE)
+  plan                  SubscriptionPlan   @default(STARTER)
+  subscriptionExpiresAt DateTime?
+
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  activeSubscription Subscription?  @relation("ActiveSubscription", fields: [subscriptionId], references: [id], onDelete: SetNull)
+  subscriptions      Subscription[] @relation("OrganizationSubscriptions")
+  users       User[]
+  buildings   Building[]
+  apartments  Apartment[]
+  tenants     Tenant[]
+  leases      Lease[]
+  payments    Payment[]
+  documents   Document[]
+  notifications Notification[]
+  maintenanceTickets MaintenanceTicket[]
+  rentalApplications RentalApplication[]
+  refreshTokens RefreshToken[]
+  propertyInspections PropertyInspection[]
+  messages        Message[]
+  staffTasks      StaffTask[]
+  reminders       Reminder[]
+
+  @@index([type])
+  @@index([subscriptionStatus])
+  @@index([plan])
+  @@map("organizations")
+}
+
+// ─── Abonnement SaaS ─────────────────────────────────────────────────────────
+
+model Subscription {
+  id                     String             @id @default(cuid())
+  organizationId         String
+  plan                   SubscriptionPlan
+  status                 SubscriptionStatus @default(ACTIVE)
+  startedAt              DateTime           @default(now())
+  expiresAt              DateTime?
+  gracePeriodEndsAt      DateTime?
+  // Préparation Stripe (non utilisé pour l'instant)
+  customerId             String?
+  externalSubscriptionId String?
+  paymentProvider        String             @default("manual")
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  organization          Organization  @relation("OrganizationSubscriptions", fields: [organizationId], references: [id], onDelete: Cascade)
+  activeForOrganization Organization? @relation("ActiveSubscription")
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([expiresAt])
+  @@map("subscriptions")
+}
+
+// ─── Utilisateurs & Auth ─────────────────────────────────────────────────────
+
+model User {
+  id             String   @id @default(cuid())
+  organizationId String?
+  email          String   @unique
+  passwordHash   String
+  firstName      String
+  lastName       String
+  phone          String?
+  role           UserRole @default(AGENT)
+  isActive       Boolean  @default(true)
+  proAccessEnabled Boolean @default(false) // Accès option Pro (décision admin)
+  lastLoginAt    DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization        Organization?           @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+  tenantProfile       Tenant?
+  refreshTokens       RefreshToken[]
+  featurePermissions  UserFeaturePermission[]
+  notifications       Notification[]
+  reportedTickets     MaintenanceTicket[] @relation("ReportedTickets")
+  assignedTickets     MaintenanceTicket[] @relation("AssignedTickets")
+  rentalApplications  RentalApplication[] @relation("ApplicantApplications")
+  reviewedApplications RentalApplication[] @relation("ReviewedApplications")
+  conductedInspections PropertyInspection[] @relation("ConductedInspections")
+  sentMessages         Message[]           @relation("SentMessages")
+  receivedMessages     Message[]           @relation("ReceivedMessages")
+  assignedTasks        StaffTask[]         @relation("AssignedTasks")
+  createdTasks         StaffTask[]         @relation("CreatedTasks")
+
+  @@index([organizationId])
+  @@index([role])
+  @@map("users")
+}
+
+// ─── Contrôle d'accès aux fonctionnalités (feature flags par utilisateur) ───
+
+model Feature {
+  id             String   @id @default(cuid())
+  key            String   @unique
+  label          String
+  description    String?
+  category       String?
+  defaultEnabled Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  userPermissions UserFeaturePermission[]
+
+  @@map("features")
+}
+
+model UserFeaturePermission {
+  id          String   @id @default(cuid())
+  userId      String
+  featureKey  String
+  isEnabled   Boolean  @default(true)
+  updatedById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  feature Feature @relation(fields: [featureKey], references: [key], onDelete: Cascade)
+
+  @@unique([userId, featureKey])
+  @@index([userId])
+  @@index([featureKey])
+  @@map("user_feature_permissions")
+}
+
+model RefreshToken {
+  id             String   @id @default(cuid())
+  userId         String
+  organizationId String?
+  tokenHash      String   @unique
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  createdAt      DateTime @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization? @relation(fields: [organizationId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ─── Biens immobiliers ───────────────────────────────────────────────────────
+
+model Building {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  address        String
+  district       String?  // Quartier (ex: Poto-Poto, Moungali)
+  city           String   @default("Brazzaville")
+  floorCount     Int?
+  latitude       Decimal? @db.Decimal(10, 7)
+  longitude      Decimal? @db.Decimal(10, 7)
+  description    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apartments   Apartment[]
+
+  @@index([organizationId])
+  @@index([organizationId, city])
+  @@map("buildings")
+}
+
+enum RentalApplicationStatus {
+  DRAFT
+  PENDING
+  UNDER_REVIEW
+  AI_SCORED
+  ACCEPTED
+  REJECTED
+  WITHDRAWN
+}
+
+enum ApplicationDocumentCategory {
+  ID_CARD
+  PROFILE_PHOTO
+  INCOME_PROOF
+  EMPLOYMENT_CONTRACT
+  PROOF_OF_ADDRESS
+  GUARANTOR_DOCUMENT
+  ADDITIONAL
+}
+
+model Apartment {
+  id             String          @id @default(cuid())
+  organizationId String
+  buildingId     String?
+  label          String          // Ex: "Appt 3B", "Studio RDC"
+  floor          Int?
+  surface        Decimal?        @db.Decimal(8, 2) // m²
+  rooms          Int?
+  rentAmount     Decimal         @db.Decimal(12, 0) // Loyer mensuel XAF (sans décimales)
+  currency       String          @default("XAF")
+  status         ApartmentStatus @default(AVAILABLE)
+  description    String?
+  amenities      String?         // JSON: équipements (clim, parking…)
+  isPublished    Boolean         @default(false)
+  publishedAt    DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  building     Building?    @relation(fields: [buildingId], references: [id], onDelete: SetNull)
+  leases       Lease[]
+  documents    Document[]   @relation("ApartmentDocuments")
+  maintenanceTickets MaintenanceTicket[]
+  applications RentalApplication[]
+  propertyInspections PropertyInspection[]
+
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@index([organizationId, isPublished])
+  @@index([buildingId])
+  @@index([isPublished, status])
+  @@map("apartments")
+}
+
+model RentalApplication {
+  id              String                  @id @default(cuid())
+  organizationId  String
+  apartmentId     String
+  applicantUserId String?
+  firstName       String
+  lastName        String
+  phone           String
+  email           String?
+  profession      String?
+  monthlyIncome   Decimal?                @db.Decimal(12, 0)
+  idNumber        String?
+  guarantorName   String?
+  guarantorPhone  String?
+  documentsNotes  String?
+  formData        Json?
+  currentStep     Int                     @default(0)
+  submittedAt     DateTime?
+  address         String?
+  employer        String?
+  guarantorEmail  String?
+  status          RentalApplicationStatus @default(DRAFT)
+  aiScore         Int?
+  aiSummary       String?
+  reviewedById    String?
+  reviewedAt      DateTime?
+  rejectionReason String?
+  createdAt       DateTime                @default(now())
+  updatedAt       DateTime                @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apartment    Apartment    @relation(fields: [apartmentId], references: [id], onDelete: Cascade)
+  applicant    User?        @relation("ApplicantApplications", fields: [applicantUserId], references: [id], onDelete: SetNull)
+  reviewedBy   User?        @relation("ReviewedApplications", fields: [reviewedById], references: [id], onDelete: SetNull)
+  documents    ApplicationDocument[]
+
+  @@index([organizationId])
+  @@index([apartmentId])
+  @@index([applicantUserId])
+  @@index([status])
+  @@map("rental_applications")
+}
+
+model ApplicationDocument {
+  id            String                      @id @default(cuid())
+  applicationId String
+  category      ApplicationDocumentCategory
+  fileName      String
+  mimeType      String
+  fileSize      Int?
+  fileUrl       String
+  storageKey    String
+  uploadedById  String?
+  createdAt     DateTime                    @default(now())
+
+  application RentalApplication @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+
+  @@index([applicationId])
+  @@index([applicationId, category])
+  @@map("application_documents")
+}
+
+// ─── Locataires ──────────────────────────────────────────────────────────────
+
+model Tenant {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String?  @unique // Lien compte app si le locataire a accès
+  firstName      String
+  lastName       String
+  phone          String
+  email          String?
+  idNumber       String?  // CNI / passeport
+  address        String?
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  leases       Lease[]
+  maintenanceTickets MaintenanceTicket[]
+  propertyInspections PropertyInspection[]
+
+  @@index([organizationId])
+  @@index([organizationId, phone])
+  @@map("tenants")
+}
+
+// ─── Contrats de location ────────────────────────────────────────────────────
+
+model Lease {
+  id             String      @id @default(cuid())
+  organizationId String
+  apartmentId    String
+  tenantId       String
+  startDate      DateTime    @db.Date
+  endDate        DateTime    @db.Date
+  monthlyRent    Decimal     @db.Decimal(12, 0)
+  depositAmount  Decimal?    @db.Decimal(12, 0)
+  currency       String      @default("XAF")
+  status         LeaseStatus @default(DRAFT)
+  terms          String?     // Clauses particulières
+  contractPdfUrl String?     // URL Cloudinary du contrat signé
+  signedAt       DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apartment    Apartment    @relation(fields: [apartmentId], references: [id], onDelete: Restrict)
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  payments     Payment[]
+  documents    Document[]   @relation("LeaseDocuments")
+  maintenanceTickets MaintenanceTicket[]
+  propertyInspections PropertyInspection[]
+
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@index([apartmentId])
+  @@index([tenantId])
+  @@index([endDate])
+  @@map("leases")
+}
+
+// ─── Paiements ───────────────────────────────────────────────────────────────
+
+model Payment {
+  id             String        @id @default(cuid())
+  organizationId String
+  leaseId        String
+  amount         Decimal       @db.Decimal(12, 0)
+  amountPaid     Decimal       @default(0) @db.Decimal(12, 0)
+  currency       String        @default("XAF")
+  dueDate        DateTime      @db.Date
+  paidAt         DateTime?
+  status         PaymentStatus @default(PENDING)
+  method         PaymentMethod?
+  periodMonth    Int           // 1-12
+  periodYear     Int
+  reference      String?       // Réf. Mobile Money / virement
+  notes          String?
+  receiptPdfUrl  String?       // URL Cloudinary du reçu
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  lease        Lease        @relation(fields: [leaseId], references: [id], onDelete: Cascade)
+  documents    Document[]   @relation("PaymentDocuments")
+  followUpLogs RentFollowUpLog[]
+
+  @@unique([leaseId, periodMonth, periodYear])
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@index([dueDate])
+  @@index([status])
+  @@map("payments")
+}
+
+// ─── Documents (Cloudinary) ──────────────────────────────────────────────────
+
+model Document {
+  id                 String       @id @default(cuid())
+  organizationId     String
+  type               DocumentType
+  fileName           String
+  mimeType           String
+  fileSize           Int?         // bytes
+  cloudinaryUrl      String
+  cloudinaryPublicId String
+  apartmentId        String?
+  leaseId            String?
+  paymentId          String?
+  uploadedById       String?
+  createdAt          DateTime     @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apartment    Apartment?   @relation("ApartmentDocuments", fields: [apartmentId], references: [id], onDelete: Cascade)
+  lease        Lease?       @relation("LeaseDocuments", fields: [leaseId], references: [id], onDelete: Cascade)
+  payment      Payment?     @relation("PaymentDocuments", fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([apartmentId])
+  @@index([leaseId])
+  @@index([paymentId])
+  @@index([type])
+  @@map("documents")
+}
+
+// ─── Notifications in-app ────────────────────────────────────────────────────
+
+model Notification {
+  id             String           @id @default(cuid())
+  organizationId String
+  userId         String?
+  type           NotificationType
+  title          String
+  message        String
+  data           Json?
+  readAt         DateTime?
+  createdAt      DateTime         @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([userId, readAt])
+  @@map("notifications")
+}
+
+// ─── Suivi loyers (rappels / relances) ───────────────────────────────────────
+
+model RentFollowUpLog {
+  id             String           @id @default(cuid())
+  organizationId String
+  paymentId      String
+  type           RentFollowUpType
+  sentAt         DateTime         @default(now())
+
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  @@unique([paymentId, type])
+  @@index([organizationId])
+  @@map("rent_follow_up_logs")
+}
+
+// ─── Maintenance (parcours 4) ────────────────────────────────────────────────
+
+model MaintenanceTicket {
+  id               String                  @id @default(cuid())
+  organizationId   String
+  apartmentId      String
+  tenantId         String?
+  leaseId          String?
+  title            String
+  description      String?
+  priority         MaintenancePriority     @default(MEDIUM)
+  status           MaintenanceTicketStatus @default(OPEN)
+  assignedToId     String?
+  assignedToName   String?
+  reportedById     String?
+  closedAt         DateTime?
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apartment    Apartment    @relation(fields: [apartmentId], references: [id], onDelete: Cascade)
+  tenant       Tenant?      @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  lease        Lease?       @relation(fields: [leaseId], references: [id], onDelete: SetNull)
+  reportedBy   User?        @relation("ReportedTickets", fields: [reportedById], references: [id], onDelete: SetNull)
+  assignedTo   User?        @relation("AssignedTickets", fields: [assignedToId], references: [id], onDelete: SetNull)
+  events       MaintenanceTicketEvent[]
+
+  @@index([organizationId, status])
+  @@index([organizationId, createdAt])
+  @@index([apartmentId])
+  @@map("maintenance_tickets")
+}
+
+model MaintenanceTicketEvent {
+  id             String               @id @default(cuid())
+  ticketId       String
+  organizationId String
+  type           MaintenanceEventType
+  message        String
+  actorId        String?
+  actorName      String?
+  createdAt      DateTime             @default(now())
+
+  ticket MaintenanceTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId, createdAt])
+  @@index([organizationId])
+  @@map("maintenance_ticket_events")
+}
+
+// ─── Journal d'audit (actions sensibles) ─────────────────────────────────────
+
+model AuditLog {
+  id             String    @id @default(cuid())
+  organizationId String?
+  userId         String?
+  userRole       UserRole?
+  ipAddress      String?
+  action         String
+  resourceType   String?
+  resourceId     String?
+  oldValue       Json?
+  newValue       Json?
+  success        Boolean   @default(true)
+  errorMessage   String?
+  createdAt      DateTime  @default(now())
+
+  @@index([organizationId, createdAt])
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@index([resourceType, resourceId])
+  @@map("audit_logs")
+}
+
+// ─── RBAC — permissions en base (matrice évolutive) ───────────────────────────
+
+model RbacPermission {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  label       String
+  category    String
+  module      String
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  roleGrants RbacRolePermission[]
+
+  @@index([module])
+  @@map("rbac_permissions")
+}
+
+model RbacRolePermission {
+  id            String   @id @default(cuid())
+  role          String
+  permissionKey String
+  createdAt     DateTime @default(now())
+
+  permission RbacPermission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@unique([role, permissionKey])
+  @@index([role])
+  @@map("rbac_role_permissions")
+}
+
+// ─── États des lieux ─────────────────────────────────────────────────────────
+
+enum InspectionType {
+  ENTRY
+  EXIT
+}
+
+enum InspectionStatus {
+  DRAFT
+  COMPLETED
+  SIGNED
+}
+
+model PropertyInspection {
+  id                 String           @id @default(cuid())
+  organizationId     String
+  apartmentId        String
+  leaseId            String?
+  tenantId           String?
+  type               InspectionType
+  status             InspectionStatus @default(DRAFT)
+  notes              String?
+  checklist          Json?
+  photos             Json?
+  tenantSignatureUrl String?
+  agentSignatureUrl  String?
+  signedAt           DateTime?
+  conductedById      String?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apartment    Apartment    @relation(fields: [apartmentId], references: [id], onDelete: Cascade)
+  lease        Lease?       @relation(fields: [leaseId], references: [id], onDelete: SetNull)
+  tenant       Tenant?      @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  conductedBy  User?        @relation("ConductedInspections", fields: [conductedById], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([apartmentId])
+  @@index([leaseId])
+  @@map("property_inspections")
+}
+
+// ─── Centre de notifications — messages, relances, tâches ─────────────────────
+
+enum StaffTaskStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+enum ReminderStatus {
+  PENDING
+  SENT
+  CANCELLED
+}
+
+model Message {
+  id             String    @id @default(cuid())
+  organizationId String
+  senderId       String
+  recipientId    String?
+  subject        String?
+  body           String
+  threadId       String?
+  readAt         DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  sender       User         @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  recipient    User?        @relation("ReceivedMessages", fields: [recipientId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([recipientId, readAt])
+  @@index([threadId])
+  @@map("messages")
+}
+
+model StaffTask {
+  id             String          @id @default(cuid())
+  organizationId String
+  title          String
+  description    String?
+  assignedToId   String?
+  createdById    String?
+  dueDate        DateTime?
+  status         StaffTaskStatus @default(PENDING)
+  completedAt    DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  assignedTo   User?        @relation("AssignedTasks", fields: [assignedToId], references: [id], onDelete: SetNull)
+  createdBy    User?        @relation("CreatedTasks", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, status])
+  @@index([assignedToId])
+  @@map("staff_tasks")
+}
+
+model Reminder {
+  id             String         @id @default(cuid())
+  organizationId String
+  type           String
+  title          String
+  message        String
+  targetUserId   String?
+  relatedType    String?
+  relatedId      String?
+  scheduledAt    DateTime
+  sentAt         DateTime?
+  status         ReminderStatus @default(PENDING)
+  createdAt      DateTime       @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, status, scheduledAt])
+  @@map("reminders")
+}
